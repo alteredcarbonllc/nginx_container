@@ -1,0 +1,200 @@
+#!/usr/bin/python3
+"""Fixed-host nginx deployment; only imported immutable image IDs are accepted."""
+import fcntl
+import json
+import os
+import pathlib
+import pwd
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+STATE = pathlib.Path('/var/lib/ac-nginx/deployments')
+SERVICE = '/etc/ac/runit/nginx'
+PODMAN = '/usr/local/bin/podman'
+CTL = '/usr/local/sbin/ac-nginxctl'
+VERIFY = '/usr/local/libexec/ac-nginx-verify-inspect'
+ENV = {'HOME': pwd.getpwuid(0).pw_dir, 'USER': 'root', 'LOGNAME': 'root',
+       'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
+MOUNTS = [
+ ('/root/git/containers_etc/nginx_container_openmailserver.net/etc/nginx', '/etc/nginx', True),
+ ('/root/git/containers_etc/nginx_container_openmailserver.net/usr/etc', '/usr/etc', True),
+ ('/var/volumes/data/nginx_container_openmailserver.net/var/www', '/var/www', True),
+ ('/var/volumes/log/nginx_container_openmailserver.net/var/log', '/var/log', True),
+ ('/var/volumes/data/letsencrypt_container_openmailserver.net/etc/letsencrypt', '/etc/letsencrypt', True),
+ ('/etc/ac/secrets/nginx', '/run/secrets/nginx', False),
+]
+
+
+def run(args, capture=False, check=True, timeout=120, input=None):
+    return subprocess.run(args, env=ENV, cwd='/', text=True, input=input,
+                          stdout=subprocess.PIPE if capture else None,
+                          check=check, timeout=timeout)
+
+
+def pod(*args, **kwargs):
+    return run([PODMAN, '--remote=false', *args], **kwargs)
+
+
+def inspect(name):
+    return json.loads(pod('container', 'inspect', name, capture=True).stdout)[0]
+
+
+def require(ok, message):
+    if not ok:
+        raise RuntimeError(message)
+
+
+def mounts(test=False):
+    args = []
+    for source, target, writable in MOUNTS:
+        # No SELinux relabel while a second container uses the same directories.
+        mode = 'rw' if writable and (not test or target == '/var/log') else 'ro'
+        args += ['--volume', source + ':' + target + ':' + mode]
+    return args
+
+
+def https():
+    result = run(['/usr/bin/curl', '--noproxy', '*', '--max-time', '10',
+                  '--resolve', 'ci.belov.email:443:93.115.20.205', '-sS',
+                  '-o', '/dev/null', '-w', '%{http_code}', 'https://ci.belov.email/'],
+                 capture=True, check=False, timeout=15)
+    return result.returncode == 0 and result.stdout == '200'
+
+
+def healthy(container_id, image_id):
+    consecutive = 0
+    started = None
+    for attempt in range(12):
+        c = inspect('nginx1')
+        require(c['Id'] == container_id and c['Image'].removeprefix('sha256:') == image_id.removeprefix('sha256:'),
+                'unexpected container/image during health check')
+        current = c['State'].get('StartedAt')
+        if c['State']['Running'] and https():
+            consecutive = consecutive + 1 if current == started else 1
+            started = current
+            if consecutive >= 3:
+                return
+        else:
+            consecutive = 0
+        time.sleep(2)
+    raise RuntimeError('HTTPS health check failed or container is restarting')
+
+
+def create(image):
+    args = ['create', '--pull=never', '--name', 'nginx1', '--network', 'ac_network',
+            '--ip', '10.89.1.224', '--ip6', 'fd00:10:89:1::224',
+            '--mac-address', 'ce:a5:c4:01:f3:cb', '--restart=no',
+            '--stop-signal=SIGQUIT', '--stop-timeout=60', '--log-driver=k8s-file']
+    args += mounts()
+    for host in ['93.115.20.205', '[2a0c:b9c0:f:433c::1]']:
+        for port in [80, 443, 7777]:
+            for protocol in ['tcp', 'udp']:
+                args += ['--publish', f'{host}:{port}:{port}/{protocol}']
+    pod(*args, image)
+
+
+def main():
+    require(os.geteuid() == 0, 'run as root')
+    require(len(sys.argv) == 3 and sys.argv[1] in ('--check', '--deploy') and
+            re.fullmatch('[0-9a-f]{40}', sys.argv[2]), 'usage: ac-nginx-deploy --check|--deploy FULL_SHA')
+    mode, revision = sys.argv[1:]
+    os.umask(0o077)
+    with open(STATE / 'lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        receipt = json.loads(pathlib.Path('/var/lib/ac-nginx/imports', revision + '.json').read_text())
+        image = receipt['image_id']
+        require(receipt['revision'] == revision and re.fullmatch('sha256:[0-9a-f]{64}', image), 'invalid import receipt')
+        info = json.loads(pod('image', 'inspect', image, capture=True).stdout)[0]
+        require(info.get('Labels', {}).get('org.opencontainers.image.revision') == revision, 'image revision mismatch')
+        require(info['Config']['Entrypoint'] == ['/entrypoint.sh'] and
+                info['Config']['Cmd'] == ['nginx', '-g', 'daemon off;'], 'unexpected image entrypoint/command')
+        old = inspect('nginx1')
+        require(old['State']['Running'], 'nginx1 must already be running')
+        require(old['HostConfig']['RestartPolicy']['Name'] in ('', 'no', 'never'), 'competing restart policy')
+        require(not pathlib.Path(SERVICE, 'down').exists(), 'service is administratively down')
+        run(['/usr/bin/sv', 'check', SERVICE])
+        run(['/usr/bin/python3', VERIFY], input=json.dumps([old]))
+        # Host SELinux relabelling needs a separate shared-label migration plan.
+        enforce = pathlib.Path('/sys/fs/selinux/enforce')
+        require(not enforce.exists() or enforce.read_text().strip() == '0', 'SELinux enforcing is not supported by this host-specific deployment')
+        for source, _, _ in MOUNTS:
+            require(pathlib.Path(source).is_dir(), 'missing mount: ' + source)
+        require(https(), 'existing HTTPS baseline is not HTTP 200')
+        token = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + uuid.uuid4().hex[:8]
+        probe = 'ac-nginx-preflight-' + token
+        try:
+            pod('run', '--rm', '--pull=never', '--name', probe, '--network', 'ac_network',
+                '--entrypoint', '/usr/sbin/nginx', *mounts(test=True), image, '-t')
+        finally:
+            pod('rm', '-f', '--ignore', probe, check=False)
+        print('CHECK_OK: ' + revision, flush=True)
+        if mode == '--check':
+            return
+        if old['Image'].removeprefix('sha256:') == image[7:]:
+            print('DEPLOY_OK: already running ' + revision)
+            return
+        backup = 'nginx1-rollback-' + token
+        journal = STATE / (token + '.json')
+        record = {'revision': revision, 'old_id': old['Id'], 'old_image': old['Image'],
+                  'new_image': image, 'backup_name': backup}
+        def phase(value):
+            record['phase'] = value
+            pending = journal.with_suffix('.tmp')
+            with open(pending, 'w') as output:
+                json.dump(record, output, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(pending, journal)
+            print('DEPLOY_PHASE: ' + value, flush=True)
+        phase('prepared')
+        try:
+            run([CTL, 'stop'])
+            require(not inspect(old['Id'])['State']['Running'], 'old container did not stop')
+            phase('stopped')
+            pod('rename', old['Id'], backup)
+            phase('renamed')
+            create(image)
+            new = inspect('nginx1')
+            record['new_id'] = new['Id']
+            phase('created')
+            run([CTL, 'start'])
+            healthy(new['Id'], image)
+            run(['/usr/bin/python3', VERIFY], input=json.dumps([inspect('nginx1')]))
+            phase('healthy')
+        except Exception:
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sig, signal.SIG_IGN)
+            print('DEPLOY_FAILED: attempting rollback', file=sys.stderr, flush=True)
+            try:
+                run([CTL, 'stop'])
+                original = inspect(old['Id'])
+                if original['Name'].lstrip('/') != 'nginx1':
+                    pod('logs', '--tail', '80', 'nginx1', check=False)
+                    pod('rm', '-f', '--ignore', 'nginx1')
+                    pod('rename', old['Id'], 'nginx1')
+                run([CTL, 'start'])
+                healthy(old['Id'], old['Image'])
+                phase('rolled_back')
+                print('ROLLBACK_OK: previous container restored', flush=True)
+            except Exception as rollback_error:
+                print('ROLLBACK_FAILED: ' + str(rollback_error) + '\nRecovery record: ' + str(journal), file=sys.stderr)
+            raise
+        print('DEPLOY_OK: ' + revision + '\nPrevious container retained: ' + backup, flush=True)
+
+
+def interrupted(signum, frame):
+    raise RuntimeError('deployment interrupted by signal ' + str(signum))
+
+
+if __name__ == '__main__':
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, interrupted)
+    try:
+        main()
+    except Exception as error:
+        print('DEPLOY_ERROR: ' + str(error), file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,5 @@
+# Append AFTER import-local-image. Keep the pipeline main push/manual filter.
+- name: deploy
+  image: bash
+  commands:
+    - sudo -n /usr/local/sbin/ac-nginx-deploy --deploy "$CI_COMMIT_SHA"
