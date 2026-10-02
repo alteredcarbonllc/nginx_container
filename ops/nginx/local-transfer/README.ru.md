@@ -10,7 +10,7 @@
 sudo sh ops/nginx/local-transfer/install.sh
 ```
 
-Зависимости: Python >=3.9, sudo/visudo, Podman /usr/local/bin/podman. Пользователь ac-ci-builder должен иметь UID 1001. Существующая директория /var/lib/ac-nginx должна принадлежать root с режимом 0755 или 0700.
+Зависимости: Python >=3.9, sudo/visudo, Podman /usr/local/bin/podman. Пользователь ac-ci-builder должен иметь UID 1001. Существующая директория /var/lib/ac-nginx должна принадлежать root без права записи для группы и остальных пользователей.
 
 Установщик ставит root-owned /usr/local/sbin/ac-nginx-import и правило sudoers только для него. Создаёт /var/spool/ac-nginx/inbox для архивов сборщика и закрытую директорию /var/lib/ac-nginx/imports для обработки и квитанций. Supervisor и контейнеры не меняются.
 
