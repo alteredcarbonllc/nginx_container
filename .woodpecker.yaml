@@ -76,3 +76,8 @@ steps:
       XDG_RUNTIME_DIR: /run/user/1001
     commands:
       - sh ops/nginx/local-transfer/export-image.sh
+
+  - name: deploy
+    image: bash
+    commands:
+      - sudo -n /usr/local/sbin/ac-nginx-deploy --deploy "$CI_COMMIT_SHA"
