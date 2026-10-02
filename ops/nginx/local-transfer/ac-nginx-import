@@ -29,14 +29,16 @@ def manifest_info(archive, revision):
         name = member.name
         if name in by_name or name.startswith('/') or '..' in pathlib.PurePosixPath(name).parts:
             raise ValueError('unsafe or duplicate archive path')
-        if not (member.isfile() or member.isdir()):
-            raise ValueError('archive links and special files are not allowed')
+        # Legacy compatibility links may exist outside the manifest's files.
+        # They are never extracted or copied into the sanitized archive.
+        if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+            raise ValueError('archive special file is not allowed: ' + name)
         by_name[name] = member
 
     def read_json(name):
         member = by_name[name]
         if not member.isfile() or member.size > 2 * 1024 * 1024:
-            raise ValueError('invalid JSON member')
+            raise ValueError('JSON member must be a small regular file: ' + name)
         with archive.extractfile(member) as source:
             data = source.read()
         return json.loads(data), data
@@ -59,7 +61,7 @@ def manifest_info(archive, revision):
         raise ValueError('duplicate image members')
     for name in selected:
         if not by_name[name].isfile():
-            raise ValueError('image member is not a regular file')
+            raise ValueError('manifest references a non-regular file: ' + name)
     return reference, 'sha256:' + hashlib.sha256(raw).hexdigest(), [by_name[n] for n in selected]
 
 
