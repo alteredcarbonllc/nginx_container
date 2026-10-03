@@ -189,7 +189,6 @@ def main():
 def interrupted(signum, frame):
     raise RuntimeError('deployment interrupted by signal ' + str(signum))
 
-
 if __name__ == '__main__':
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, interrupted)
@@ -198,3 +197,21 @@ if __name__ == '__main__':
     except Exception as error:
         print('DEPLOY_ERROR: ' + str(error), file=sys.stderr)
         sys.exit(1)
+
+    # main() released the deployment lock.
+    # Cleanup failure must not turn a successful deployment into a failure.
+    if sys.argv[1] == '--deploy':
+        try:
+            result = run(
+                ['/usr/local/sbin/ac-nginx-cleanup', '--apply'],
+                check=False,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                print(
+                    'CLEANUP_WARNING: cleanup did not complete; '
+                    'deployment remains successful',
+                    file=sys.stderr,
+                )
+        except Exception as error:
+            print('CLEANUP_WARNING: ' + str(error), file=sys.stderr)
