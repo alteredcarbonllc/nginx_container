@@ -11,8 +11,13 @@ import subprocess
 import sys
 import time
 import uuid
+sys.path.insert(0, "/usr/local/libexec")
+from ac_nginx_release import validate_config, config_mount, RELEASES
+CHECKER = "/usr/local/libexec/ac-nginx-config-tools"
+HTTP3_IMAGE = pathlib.Path("/etc/ac/nginx-http3-image")
 
 STATE = pathlib.Path('/var/lib/ac-nginx/deployments')
+IMPORTS = pathlib.Path('/var/lib/ac-nginx/imports')
 SERVICE = '/etc/ac/runit/nginx'
 PODMAN = '/usr/local/bin/podman'
 CTL = '/usr/local/sbin/ac-nginxctl'
@@ -97,33 +102,77 @@ def create(image):
     pod(*args, image)
 
 
+def check_client():
+    st = HTTP3_IMAGE.lstat()
+    require(not HTTP3_IMAGE.is_symlink() and st.st_uid == 0 and not st.st_mode & 0o022,
+            'untrusted HTTP/3 image pin')
+    image = HTTP3_IMAGE.read_text().strip()
+    require(re.fullmatch('sha256:[0-9a-f]{64}', image), 'invalid HTTP/3 image pin')
+    pod('image', 'inspect', image, capture=True)
+    return image
+
+
+def site_checks(config, client):
+    release = validate_config(config)
+    if release is None:
+        print('SITE_CHECKS: migration-v1 uses existing HTTPS baseline', flush=True)
+        return
+    require(client is not None, 'HTTP/3 client is required')
+    # Checker is installed trusted code; release supplies only site data/configuration.
+    prefix = PODMAN + ' --remote=false run --rm --pull=never --network host ' + client + ' curl'
+    command = ['/usr/bin/python3', CHECKER, '--source', str(release / 'source'),
+               'check', '--address', '93.115.20.205', '--curl', prefix]
+    run(command, timeout=1800)
+    run(command + ['--http3'], timeout=1800)
+
+
 def main():
     require(os.geteuid() == 0, 'run as root')
-    require(len(sys.argv) == 3 and sys.argv[1] in ('--check', '--deploy') and
-            re.fullmatch('[0-9a-f]{40}', sys.argv[2]), 'usage: ac-nginx-deploy --check|--deploy FULL_SHA')
+    require(len(sys.argv) == 3 and sys.argv[1] in ('--check', '--deploy', '--check-config', '--deploy-config') and
+            re.fullmatch('[0-9a-f]{40}', sys.argv[2]), 'usage: ac-nginx-deploy --check|--deploy IMAGE_SHA or --check-config|--deploy-config CONFIG_SHA')
     mode, revision = sys.argv[1:]
     os.umask(0o077)
     with open(STATE / 'lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        receipt = json.loads(pathlib.Path('/var/lib/ac-nginx/imports', revision + '.json').read_text())
+        old = inspect('nginx1')
+        old_config = config_mount(old)
+        validate_config(old_config)
+        config_mode = mode.endswith('-config')
+        if config_mode:
+            require(os.environ.get('SUDO_USER') != 'ac-ci-builder',
+                    'config deployment requires administrator access')
+            config = str(RELEASES / revision / 'nginx')
+            config_revision = revision
+            old_info = json.loads(pod('image', 'inspect', old['Image'], capture=True).stdout)[0]
+            revision = old_info.get('Labels', {}).get('org.opencontainers.image.revision', '')
+            require(re.fullmatch('[0-9a-f]{40}', revision), 'invalid current image revision')
+        else:
+            config = old_config
+            config_revision = None if config.endswith('/migration-v1') else pathlib.Path(config).parent.name
+        validate_config(config)
+        MOUNTS[0] = (config, '/etc/nginx', False)
+        receipt = json.loads((IMPORTS / (revision + '.json')).read_text())
         image = receipt['image_id']
         require(receipt['revision'] == revision and re.fullmatch('sha256:[0-9a-f]{64}', image), 'invalid import receipt')
+        if config_mode:
+            require(old['Image'].removeprefix('sha256:') == image[7:], 'current image differs from import receipt')
         info = json.loads(pod('image', 'inspect', image, capture=True).stdout)[0]
         require(info.get('Labels', {}).get('org.opencontainers.image.revision') == revision, 'image revision mismatch')
         require(info['Config']['Entrypoint'] == ['/entrypoint.sh'] and
                 info['Config']['Cmd'] == ['nginx', '-g', 'daemon off;'], 'unexpected image entrypoint/command')
-        old = inspect('nginx1')
         require(old['State']['Running'], 'nginx1 must already be running')
         require(old['HostConfig']['RestartPolicy']['Name'] in ('', 'no', 'never'), 'competing restart policy')
         require(not pathlib.Path(SERVICE, 'down').exists(), 'service is administratively down')
         run(['/usr/bin/sv', 'check', SERVICE])
-        run(['/usr/bin/python3', VERIFY, '--allow-legacy'], input=json.dumps([old]))
+        run(['/usr/bin/python3', VERIFY], input=json.dumps([old]))
         # Host SELinux relabelling needs a separate shared-label migration plan.
         enforce = pathlib.Path('/sys/fs/selinux/enforce')
         require(not enforce.exists() or enforce.read_text().strip() == '0', 'SELinux enforcing is not supported by this host-specific deployment')
         for source, _, _ in MOUNTS:
             require(pathlib.Path(source).is_dir(), 'missing mount: ' + source)
         require(https(), 'existing HTTPS baseline is not HTTP 200')
+        client = check_client() if config_revision is not None else None
+        site_checks(old_config, client)
         token = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-' + uuid.uuid4().hex[:8]
         probe = 'ac-nginx-preflight-' + token
         try:
@@ -131,8 +180,8 @@ def main():
                 '--entrypoint', '/usr/sbin/nginx', *mounts(test=True), image, '-t')
         finally:
             pod('rm', '-f', '--ignore', probe, check=False)
-        print('CHECK_OK: ' + revision, flush=True)
-        if mode == '--check':
+        print('CHECK_OK: image=' + revision + ' config=' + str(config_revision or 'migration-v1'), flush=True)
+        if mode in ('--check', '--check-config'):
             return
         config_current = any(
             m['Destination'] == '/etc/nginx'
@@ -141,12 +190,15 @@ def main():
             for m in old['Mounts']
         )
         if old['Image'].removeprefix('sha256:') == image[7:] and config_current:
-            print('DEPLOY_OK: already running ' + revision)
+            print('DEPLOY_OK: already running image=' + revision + ' config=' + str(config_revision or 'migration-v1'))
             return
         backup = 'nginx1-rollback-' + token
         journal = STATE / (token + '.json')
         record = {'revision': revision, 'old_id': old['Id'], 'old_image': old['Image'],
-                  'new_image': image, 'backup_name': backup}
+                  'new_image': image, 'backup_name': backup,
+                  'operation': 'config' if config_mode else 'image',
+                  'old_config': old_config, 'new_config': config,
+                  'config_revision': config_revision}
         def phase(value):
             record['phase'] = value
             pending = journal.with_suffix('.tmp')
@@ -170,6 +222,9 @@ def main():
             run([CTL, 'start'])
             healthy(new['Id'], image)
             run(['/usr/bin/python3', VERIFY], input=json.dumps([inspect('nginx1')]))
+            require(config_mount(inspect('nginx1')) == config, 'unexpected config after deployment')
+            site_checks(config, client)
+            healthy(new['Id'], image)
             phase('healthy')
         except Exception:
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -184,12 +239,15 @@ def main():
                     pod('rename', old['Id'], 'nginx1')
                 run([CTL, 'start'])
                 healthy(old['Id'], old['Image'])
+                run(['/usr/bin/python3', VERIFY], input=json.dumps([inspect('nginx1')]))
+                require(config_mount(inspect('nginx1')) == old_config, 'unexpected rollback config')
+                site_checks(old_config, client)
                 phase('rolled_back')
                 print('ROLLBACK_OK: previous container restored', flush=True)
             except Exception as rollback_error:
                 print('ROLLBACK_FAILED: ' + str(rollback_error) + '\nRecovery record: ' + str(journal), file=sys.stderr)
             raise
-        print('DEPLOY_OK: ' + revision + '\nPrevious container retained: ' + backup, flush=True)
+        print('DEPLOY_OK: image=' + revision + ' config=' + str(config_revision or 'migration-v1') + '\nPrevious container retained: ' + backup, flush=True)
 
 
 def interrupted(signum, frame):
@@ -206,7 +264,7 @@ if __name__ == '__main__':
 
     # main() released the deployment lock.
     # Cleanup failure must not turn a successful deployment into a failure.
-    if sys.argv[1] == '--deploy':
+    if sys.argv[1] in ('--deploy', '--deploy-config'):
         try:
             result = run(
                 ['/usr/local/sbin/ac-nginx-cleanup', '--apply'],

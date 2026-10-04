@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+"""Prepare an administrator-owned config release from the local nginx_config Git repository."""
+import fcntl
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+sys.path.insert(0, '/usr/local/libexec')
+from ac_nginx_release import RELEASES, trusted, validate_config
+
+REPO = '/root/git/nginx_config'
+POD = ['/usr/local/bin/podman', '--remote=false']
+ENV = dict(PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', HOME='/root',
+           USER='root', LOGNAME='root', LANG='C.UTF-8')
+
+def run(args, **kw):
+    return subprocess.run(args, env=ENV, cwd='/', check=True, timeout=120, **kw)
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 2 or not re.fullmatch('[0-9a-f]{40}', sys.argv[1]):
+        raise ValueError('usage as root: ac-nginx-config-prepare FULL_CONFIG_SHA')
+    revision = sys.argv[1]
+    os.umask(0o077)
+    with open('/var/lib/ac-nginx/deployments/lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for p in reversed(RELEASES.parents): trusted(p, True)
+        trusted(RELEASES, True)
+        target = RELEASES / revision
+        if target.exists():
+            validate_config(str(target / 'nginx'))
+            print('RELEASE_EXISTS: ' + str(target))
+            return
+        commit = run(['git', '-C', REPO, 'rev-parse', revision + '^{commit}'], capture_output=True, text=True).stdout.strip()
+        if commit != revision: raise ValueError('not an exact commit')
+        stage = Path(tempfile.mkdtemp(prefix='.prepare.', dir=RELEASES))
+        probe = 'ac-nginx-config-prepare-' + stage.name.removeprefix('.prepare.')
+        try:
+            archive = stage / 'source.tar'
+            with archive.open('wb') as out:
+                run(['git', '-C', REPO, 'archive', '--format=tar', revision], stdout=out)
+            source = stage / 'source'; source.mkdir(mode=0o755)
+            with tarfile.open(archive, 'r:') as tar:
+                members = tar.getmembers()
+                if len(members) > 10000 or sum(m.size for m in members) > 20 * 1024 * 1024:
+                    raise ValueError('configuration archive is too large')
+                names = set()
+                for m in members:
+                    rel = Path(m.name)
+                    if rel.is_absolute() or '..' in rel.parts or m.name in names or not (m.isfile() or m.isdir()):
+                        raise ValueError('unsafe archive member: ' + m.name)
+                    names.add(m.name)
+                    dest = source / rel
+                    if m.isdir(): dest.mkdir(parents=True, exist_ok=True, mode=0o755)
+                    else:
+                        dest.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                        with tar.extractfile(m) as src, dest.open('xb') as out: shutil.copyfileobj(src, out)
+                        dest.chmod(0o644)
+            archive.unlink()
+            run(['/usr/bin/python3', '/usr/local/libexec/ac-nginx-config-tools', '--source', str(source),
+                 'build', '--output', str(stage / 'nginx')])
+            image = run(POD + ['inspect', 'nginx1', '--format', '{{.Image}}'], capture_output=True, text=True).stdout.strip()
+            mounts = [
+                (str(stage / 'nginx'), '/etc/nginx', 'ro'),
+                ('/root/git/containers_etc/nginx_container_openmailserver.net/usr/etc', '/usr/etc', 'ro'),
+                ('/var/volumes/data/nginx_container_openmailserver.net/var/www', '/var/www', 'ro'),
+                ('/var/volumes/log/nginx_container_openmailserver.net/var/log', '/var/log', 'rw'),
+                ('/var/volumes/data/letsencrypt_container_openmailserver.net/etc/letsencrypt', '/etc/letsencrypt', 'ro'),
+                ('/etc/ac/secrets/nginx', '/run/secrets/nginx', 'ro'),
+            ]
+            args = POD + ['run', '--rm', '--pull=never', '--name', probe, '--network', 'ac_network', '--entrypoint', '/usr/sbin/nginx']
+            for src, dst, mode in mounts: args += ['-v', src + ':' + dst + ':' + mode]
+            run(args + [image, '-t'])
+            hashes = {str(p.relative_to(stage)): hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in sorted(stage.rglob('*')) if p.is_file()}
+            (stage / 'release.json').write_text(json.dumps(dict(revision=revision, syntax_checked_image=image, sha256=hashes), indent=2) + '\n')
+            # Root of mount must remain traversable by nginx workers; staging root stays private.
+            for p in stage.rglob('*'): p.chmod(0o555 if p.is_dir() else 0o444)
+            stage.chmod(0o500)
+            stage.rename(target)
+            validate_config(str(target / 'nginx'))
+            print('RELEASE_READY: ' + revision)
+            print('CONFIG_PATH: ' + str(target / 'nginx'))
+        finally:
+            subprocess.run(POD + ['rm', '-f', '--ignore', probe], env=ENV, timeout=30, check=False, stdout=subprocess.DEVNULL)
+            if stage.exists(): shutil.rmtree(stage)
+
+if __name__ == '__main__':
+    try: main()
+    except Exception as error:
+        print('PREPARE_FAILED: ' + str(error), file=sys.stderr)
+        sys.exit(1)

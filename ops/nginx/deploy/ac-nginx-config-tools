@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Build a mountable /etc/nginx tree or check enabled sites. Python 3.10+."""
+import argparse
+import ipaddress
+import json
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+ROOT=Path(__file__).resolve().parents[1]
+
+def inventory():
+    sites=[]
+    for folder in sorted((ROOT/'sites').iterdir()):
+        if not folder.is_dir(): continue
+        if not re.fullmatch(r'[a-z0-9][a-z0-9.-]*',folder.name):
+            raise ValueError('invalid site directory: '+folder.name)
+        data=json.loads((folder/'checks.json').read_text())
+        if not isinstance(data.get('enabled'),bool): raise ValueError('enabled must be boolean')
+        conf=(folder/'nginx.conf').read_text()
+        hosts=set(re.findall(r'\bserver_name\s+([^;]+);',conf))
+        hosts={h for group in hosts for h in group.split()}
+        for c in data['checks']:
+            if c['host'] not in hosts: raise ValueError('check host not declared: '+c['host'])
+            if c['scheme'] not in ('http','https') or not c['path'].startswith('/'):
+                raise ValueError('invalid check URL')
+            if not isinstance(c['status'],int) or not isinstance(c['headers'],dict):
+                raise ValueError('invalid check expectations')
+        if data['enabled']: sites.append((folder,data))
+    if not sites: raise ValueError('no enabled sites')
+    return sites
+
+def build(output):
+    sites=inventory()
+    output=Path(output).resolve()
+    if output.exists(): raise ValueError('output exists; use a new empty destination')
+    for p in ROOT.rglob('*'):
+        if p.is_symlink(): raise ValueError('source symlinks are not supported: '+str(p))
+    shutil.copytree(ROOT/'nginx',output)
+    includes=[]
+    for folder,data in sites:
+        dest=output/'sites'/folder.name
+        dest.mkdir(parents=True)
+        shutil.copy2(folder/'nginx.conf',dest/'nginx.conf')
+        includes.append('include /etc/nginx/sites/'+folder.name+'/nginx.conf;')
+    (output/'enabled.conf').write_text('\n'.join(includes)+'\n')
+    files=[p for p in output.rglob('*') if p.is_file()]
+    text='\n'.join(p.read_text() for p in files)
+    if 'PRIVATE KEY-----' in text: raise ValueError('private key in output')
+    for target in re.findall(r'^\s*include\s+([^;]+);',text,re.M):
+        rel=target.removeprefix('/etc/nginx/')
+        if rel.startswith('/') or not (output/rel).is_file():
+            raise ValueError('unresolved include: '+target)
+    for addr in ('443','[::]:443'):
+        matches=re.findall(r'^\s*listen\s+'+re.escape(addr)+r'\s+quic\s+reuseport\s+default_server;',text,re.M)
+        if len(matches)!=1: raise ValueError('expected one infrastructure QUIC reuseport: '+addr)
+    if re.search(r'^\s*listen\s+[^;]*7777',text,re.M): raise ValueError('obsolete listener 7777')
+    print('BUILD_OK:',output,'sites='+str(len(sites)))
+    print('Structural checks only. Run nginx -t with the production image before use.')
+
+def check(args):
+    address=str(ipaddress.ip_address(args.address)) if args.address else None
+    if address and ':' in address: address='['+address+']'
+    command=shlex.split(args.curl)
+    failures=0
+    count=0
+    for folder,data in inventory():
+        for c in data['checks']:
+            if args.http3 and not c.get('http3',False): continue
+            count+=1
+            url=c['scheme']+'://'+c['host']+c['path']
+            cmd=command+['--noproxy','*','--connect-timeout','10','--max-time','20','-sS','-D','-','-o','/dev/null']
+            if address:
+                cmd+=['--resolve',c['host']+(':'+('443' if c['scheme']=='https' else '80')+':'+address)]
+            if args.http3: cmd+=['--http3-only']
+            cmd+=[url]
+            try:
+                result=subprocess.run(cmd,text=True,capture_output=True,timeout=45)
+                lines=result.stdout.replace('\r\n','\n').splitlines()
+                headers={};status=None;protocol=None
+                for line in lines:
+                    if line.startswith('HTTP/'):
+                        parts=line.split();protocol=parts[0];status=int(parts[1]);headers={}
+                    elif ':' in line:
+                        name,value=line.split(':',1)
+                        headers.setdefault(name.lower(),[]).append(value.strip())
+                ok=result.returncode==0 and status==c['status']
+                if args.http3: ok=ok and protocol=='HTTP/3'
+                for key,value in c['headers'].items():
+                    ok=ok and headers.get(key.lower())==[value]
+                print(('PASS' if ok else 'FAIL'),url,'status='+str(status),'protocol='+str(protocol))
+                if not ok:
+                    failures+=1
+                    print(' expected:',c['status'],c['headers'])
+                    print(' received:',headers)
+                    if result.stderr: print(result.stderr.strip())
+            except (OSError,subprocess.TimeoutExpired) as e:
+                failures+=1;print('FAIL',url,str(e))
+    print('SUMMARY: checks='+str(count)+' failures='+str(failures))
+    return 1 if failures or not count else 0
+
+def main():
+    global ROOT
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--source', required=True)
+    sub=p.add_subparsers(dest='action',required=True)
+    b=sub.add_parser('build');b.add_argument('--output',default=str(ROOT/'dist/nginx'))
+    c=sub.add_parser('check');c.add_argument('--address');c.add_argument('--http3',action='store_true')
+    c.add_argument('--curl',default='curl',help='command prefix, parsed without a shell')
+    args=p.parse_args()
+    ROOT=Path(args.source).resolve()
+    if args.action=='build':build(args.output);return 0
+    return check(args)
+if __name__=='__main__':
+    try:sys.exit(main())
+    except Exception as e:print('ERROR:',e,file=sys.stderr);sys.exit(1)
