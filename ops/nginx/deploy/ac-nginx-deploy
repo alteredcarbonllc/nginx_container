@@ -20,7 +20,7 @@ VERIFY = '/usr/local/libexec/ac-nginx-verify-inspect'
 ENV = {'HOME': pwd.getpwuid(0).pw_dir, 'USER': 'root', 'LOGNAME': 'root',
        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
 MOUNTS = [
- ('/root/git/containers_etc/nginx_container_openmailserver.net/etc/nginx', '/etc/nginx', True),
+ ('/var/lib/ac-nginx/config-releases/migration-v1', '/etc/nginx', False),
  ('/root/git/containers_etc/nginx_container_openmailserver.net/usr/etc', '/usr/etc', True),
  ('/var/volumes/data/nginx_container_openmailserver.net/var/www', '/var/www', True),
  ('/var/volumes/log/nginx_container_openmailserver.net/var/log', '/var/log', True),
@@ -91,7 +91,7 @@ def create(image):
             '--stop-signal=SIGQUIT', '--stop-timeout=60', '--log-driver=k8s-file']
     args += mounts()
     for host in ['93.115.20.205', '[2a0c:b9c0:f:433c::1]']:
-        for port in [80, 443, 7777]:
+        for port in [80, 443]:
             for protocol in ['tcp', 'udp']:
                 args += ['--publish', f'{host}:{port}:{port}/{protocol}']
     pod(*args, image)
@@ -117,7 +117,7 @@ def main():
         require(old['HostConfig']['RestartPolicy']['Name'] in ('', 'no', 'never'), 'competing restart policy')
         require(not pathlib.Path(SERVICE, 'down').exists(), 'service is administratively down')
         run(['/usr/bin/sv', 'check', SERVICE])
-        run(['/usr/bin/python3', VERIFY], input=json.dumps([old]))
+        run(['/usr/bin/python3', VERIFY, '--allow-legacy'], input=json.dumps([old]))
         # Host SELinux relabelling needs a separate shared-label migration plan.
         enforce = pathlib.Path('/sys/fs/selinux/enforce')
         require(not enforce.exists() or enforce.read_text().strip() == '0', 'SELinux enforcing is not supported by this host-specific deployment')
@@ -134,7 +134,13 @@ def main():
         print('CHECK_OK: ' + revision, flush=True)
         if mode == '--check':
             return
-        if old['Image'].removeprefix('sha256:') == image[7:]:
+        config_current = any(
+            m['Destination'] == '/etc/nginx'
+            and m['Source'] == MOUNTS[0][0]
+            and not m['RW']
+            for m in old['Mounts']
+        )
+        if old['Image'].removeprefix('sha256:') == image[7:] and config_current:
             print('DEPLOY_OK: already running ' + revision)
             return
         backup = 'nginx1-rollback-' + token
