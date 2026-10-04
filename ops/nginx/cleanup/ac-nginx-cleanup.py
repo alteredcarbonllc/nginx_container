@@ -111,6 +111,10 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+        if (BASE / 'config-cleanup-enabled').is_file():
+            command = ['/usr/local/sbin/ac-nginx-config-cleanup']
+            if '--apply' in __import__('sys').argv[1:]: command.append('--apply')
+            subprocess.run(command, env=ENV, cwd='/', check=True, timeout=300)
     except BlockingIOError:
         print('CLEANUP_BUSY: import/deploy/cleanup is running; nothing removed')
         raise SystemExit(1)
