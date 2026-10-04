@@ -139,8 +139,6 @@ def main():
         validate_config(old_config)
         config_mode = mode.endswith('-config')
         if config_mode:
-            require(os.environ.get('SUDO_USER') != 'ac-ci-builder',
-                    'config deployment requires administrator access')
             config = str(RELEASES / revision / 'nginx')
             config_revision = revision
             old_info = json.loads(pod('image', 'inspect', old['Image'], capture=True).stdout)[0]

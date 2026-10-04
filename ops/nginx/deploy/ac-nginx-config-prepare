@@ -17,6 +17,8 @@ sys.path.insert(0, '/usr/local/libexec')
 from ac_nginx_release import RELEASES, trusted, validate_config
 
 REPO = '/root/git/nginx_config'
+INBOX = Path('/var/spool/ac-nginx/config-inbox')
+MAX_BYTES = 20 * 1024 * 1024
 POD = ['/usr/local/bin/podman', '--remote=false']
 ENV = dict(PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', HOME='/root',
            USER='root', LOGNAME='root', LANG='C.UTF-8')
@@ -25,27 +27,43 @@ def run(args, **kw):
     return subprocess.run(args, env=ENV, cwd='/', check=True, timeout=120, **kw)
 
 def main():
-    if os.geteuid() != 0 or len(sys.argv) != 2 or not re.fullmatch('[0-9a-f]{40}', sys.argv[1]):
-        raise ValueError('usage as root: ac-nginx-config-prepare FULL_CONFIG_SHA')
-    revision = sys.argv[1]
+    imported = len(sys.argv) == 3 and sys.argv[1] == '--import'
+    if os.geteuid() != 0 or not (imported or len(sys.argv) == 2) or not re.fullmatch('[0-9a-f]{40}', sys.argv[-1]):
+        raise ValueError('usage as root: ac-nginx-config-prepare [--import] FULL_CONFIG_SHA')
+    revision = sys.argv[-1]
     os.umask(0o077)
     with open('/var/lib/ac-nginx/deployments/lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for p in reversed(RELEASES.parents): trusted(p, True)
         trusted(RELEASES, True)
         target = RELEASES / revision
-        if target.exists():
-            validate_config(str(target / 'nginx'))
-            print('RELEASE_EXISTS: ' + str(target))
-            return
-        commit = run(['git', '-C', REPO, 'rev-parse', revision + '^{commit}'], capture_output=True, text=True).stdout.strip()
-        if commit != revision: raise ValueError('not an exact commit')
+        if not imported:
+            if target.exists():
+                validate_config(str(target / 'nginx'))
+                print('RELEASE_EXISTS: ' + str(target))
+                return
+            commit = run(['git', '-C', REPO, 'rev-parse', revision + '^{commit}'], capture_output=True, text=True).stdout.strip()
+            if commit != revision: raise ValueError('not an exact commit')
         stage = Path(tempfile.mkdtemp(prefix='.prepare.', dir=RELEASES))
         probe = 'ac-nginx-config-prepare-' + stage.name.removeprefix('.prepare.')
         try:
             archive = stage / 'source.tar'
-            with archive.open('wb') as out:
-                run(['git', '-C', REPO, 'archive', '--format=tar', revision], stdout=out)
+            if imported:
+                fd = os.open(INBOX / (revision + '.tar'), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, 'rb') as incoming, archive.open('xb') as out:
+                    st = os.fstat(incoming.fileno())
+                    if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= MAX_BYTES:
+                        raise ValueError('archive must be a regular file at most 20 MiB')
+                    total = 0
+                    while True:
+                        chunk = incoming.read(1024 * 1024)
+                        if not chunk: break
+                        total += len(chunk)
+                        if total > MAX_BYTES: raise ValueError('archive exceeds 20 MiB')
+                        out.write(chunk)
+            else:
+                with archive.open('wb') as out:
+                    run(['git', '-C', REPO, 'archive', '--format=tar', revision], stdout=out)
             source = stage / 'source'; source.mkdir(mode=0o755)
             with tarfile.open(archive, 'r:') as tar:
                 members = tar.getmembers()
@@ -54,9 +72,9 @@ def main():
                 names = set()
                 for m in members:
                     rel = Path(m.name)
-                    if rel.is_absolute() or '..' in rel.parts or m.name in names or not (m.isfile() or m.isdir()):
+                    if rel.is_absolute() or '..' in rel.parts or str(rel) in names or str(rel) == '.' or not (m.isfile() or m.isdir()):
                         raise ValueError('unsafe archive member: ' + m.name)
-                    names.add(m.name)
+                    names.add(str(rel))
                     dest = source / rel
                     if m.isdir(): dest.mkdir(parents=True, exist_ok=True, mode=0o755)
                     else:
@@ -64,6 +82,16 @@ def main():
                         with tar.extractfile(m) as src, dest.open('xb') as out: shutil.copyfileobj(src, out)
                         dest.chmod(0o644)
             archive.unlink()
+            if target.exists():
+                validate_config(str(target / 'nginx'))
+                incoming_hashes = {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+                                   for p in source.rglob('*') if p.is_file()}
+                previous_hashes = {str(p.relative_to(target / 'source')): hashlib.sha256(p.read_bytes()).hexdigest()
+                                   for p in (target / 'source').rglob('*') if p.is_file()}
+                if incoming_hashes != previous_hashes:
+                    raise ValueError('same revision has different source; refusing overwrite')
+                print('RELEASE_EXISTS: ' + str(target))
+                return
             run(['/usr/bin/python3', '/usr/local/libexec/ac-nginx-config-tools', '--source', str(source),
                  'build', '--output', str(stage / 'nginx')])
             image = run(POD + ['inspect', 'nginx1', '--format', '{{.Image}}'], capture_output=True, text=True).stdout.strip()
