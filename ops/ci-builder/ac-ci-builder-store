@@ -1,0 +1,195 @@
+#!/usr/bin/python3
+"""Cooperative rootless build locks and conservative image retention."""
+import argparse
+from datetime import datetime, timedelta, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+UID = 1001
+HOME = '/var/lib/ac-ci-builder'
+STATE = Path(HOME, '.local/state/ac-ci-builder')
+FLAG = Path('/etc/ac/ci-builder-cleanup-enabled')
+PODMAN = '/usr/local/bin/podman'
+REPOS = {'nginx': 'localhost/nginx-container', 'php': 'localhost/php-carbonblog'}
+
+
+def image_id(value):
+    value = value.removeprefix('sha256:')
+    if not re.fullmatch('[0-9a-f]{64}', value):
+        raise ValueError('Expected full image ID')
+    return value
+
+
+def created(value):
+    # Go timestamps can contain nanoseconds; datetime needs at most microseconds.
+    value = re.sub(r'(\.\d{6})\d+', r'\1', value)
+    result = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if result.tzinfo is None:
+        raise ValueError('Image creation time has no timezone')
+    return result
+
+
+def candidates(images, used, now):
+    rows = {}
+    parents = set()
+    for data in images:
+        ident = image_id(data['Id'])
+        if ident in rows:
+            raise ValueError('Duplicate image in inventory')
+        tags = data.get('RepoTags') or []
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            raise ValueError('Invalid image tags')
+        owners = set()
+        allowed = bool(tags)
+        for tag in tags:
+            repo, _, revision = tag.rpartition(':')
+            if repo not in REPOS.values() or not re.fullmatch('[0-9a-f]{40}', revision):
+                allowed = False
+            else:
+                owners.add(repo)
+        rows[ident] = (created(data['Created']), tags, owners, allowed)
+        if data.get('Parent'):
+            parent = image_id(data['Parent'])
+            if parent != '0' * 64:
+                parents.add(parent)
+    keep = set(used) | parents
+    for repo in REPOS.values():
+        versions = sorted((r[0], ident) for ident, r in rows.items() if repo in r[2])
+        keep.update(ident for _, ident in versions[-3:])
+    cutoff = now - timedelta(days=7)
+    return [(ident, row[1]) for ident, row in sorted(rows.items(), key=lambda item: (item[1][0], item[0]))
+            if row[3] and ident not in keep and row[0] < cutoff]
+
+
+def pod(*args, check=True):
+    return subprocess.run([PODMAN, '--remote=false', *args], check=check,
+                          text=True, stdout=subprocess.PIPE, timeout=300)
+
+
+def guard():
+    if os.geteuid() != UID:
+        raise ValueError('Run as ac-ci-builder UID 1001, never as root')
+    for key in ('CONTAINER_HOST', 'CONTAINER_CONNECTION', 'CONTAINERS_STORAGE_CONF',
+                'STORAGE_DRIVER', 'STORAGE_OPTS', 'CONTAINERS_CONF', 'CONTAINERS_CONF_OVERRIDE'):
+        os.environ.pop(key, None)
+    os.environ.update(HOME=HOME, XDG_DATA_HOME=HOME + '/.local/share',
+                      XDG_CONFIG_HOME=HOME + '/.config', XDG_RUNTIME_DIR='/run/user/1001')
+    if pod('info', '--format', '{{.Host.Security.Rootless}}').stdout.strip() != 'true':
+        raise ValueError('Refusing non-rootless storage')
+    path = pod('info', '--format', '{{.Store.GraphRoot}}').stdout.strip()
+    if path != HOME + '/.local/share/containers/storage':
+        raise ValueError('Unexpected graphroot: ' + path)
+
+
+def lock(name, operation):
+    info = STATE.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != UID or info.st_mode & 0o077:
+        raise ValueError('Unsafe lock directory')
+    fd = os.open(STATE / name, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != UID or info.st_mode & 0o077:
+            raise ValueError('Unsafe lock file')
+        fcntl.flock(fd, operation)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def snapshot():
+    ids = sorted(set(pod('images', '-aq', '--no-trunc').stdout.split()))
+    images = []
+    for start in range(0, len(ids), 100):
+        images.extend(json.loads(pod('image', 'inspect', *ids[start:start + 100]).stdout))
+    containers = pod('ps', '-aq', '--no-trunc').stdout.split()
+    used = set()
+    for start in range(0, len(containers), 100):
+        for c in json.loads(pod('container', 'inspect', *containers[start:start + 100]).stdout):
+            used.add(image_id(c['Image']))
+    return images, used
+
+
+def enabled():
+    try:
+        info = FLAG.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Unsafe activation flag')
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='mode', required=True)
+    build = sub.add_parser('run')
+    build.add_argument('project', choices=REPOS)
+    build.add_argument('command', nargs=argparse.REMAINDER)
+    clean = sub.add_parser('cleanup')
+    clean.add_argument('--apply', action='store_true')
+    args = parser.parse_args()
+    guard()
+    if args.mode == 'run':
+        command = args.command
+        if command[:1] == ['--']:
+            command = command[1:]
+        if not command:
+            raise ValueError('Missing command')
+        # Shared globally, exclusive within a project (including duplicate SHA runs).
+        global_fd = lock('store.lock', fcntl.LOCK_SH)
+        project_fd = lock(args.project + '.lock', fcntl.LOCK_EX)
+        for fd in (global_fd, project_fd):
+            os.set_inheritable(fd, True)
+        print('BUILDER_LOCKED: ' + args.project, flush=True)
+        os.execvpe(command[0], command, os.environ)
+    if args.apply and not enabled():
+        print('BUILDER_CLEANUP_SKIPPED: activation flag absent')
+        return
+    try:
+        fd = lock('store.lock', fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print('BUILDER_CLEANUP_SKIPPED: build or cleanup holds lock')
+        return
+    try:
+        images, used = snapshot()
+        planned = candidates(images, used, datetime.now(timezone.utc))
+        removed = 0
+        for ident, tags in planned:
+            if not args.apply:
+                print('DRY_RUN REMOVE_IMAGE ' + ident + ' ' + ','.join(tags))
+                continue
+            # Recheck complete inventory before each deletion, fail closed on errors.
+            images, used = snapshot()
+            current = dict(candidates(images, used, datetime.now(timezone.utc)))
+            if ident not in current or sorted(current[ident]) != sorted(tags):
+                print('SKIP_CHANGED: ' + ident)
+                continue
+            print('APPLY REMOVE_IMAGE ' + ident + ' ' + ','.join(tags), flush=True)
+            result = pod('rmi', '--no-prune', ident, check=False)
+            if result.stdout:
+                print(result.stdout, end='')
+            if result.returncode == 2:
+                print('SKIP_IN_USE_OR_HAS_CHILDREN: ' + ident)
+            elif result.returncode:
+                raise RuntimeError('Podman rmi failed: ' + str(result.returncode))
+            else:
+                removed += 1
+        print(('APPLY_BUILDER_OK: removed=' + str(removed)) if args.apply
+              else ('DRY_RUN_BUILDER_OK: images=' + str(len(planned))))
+    finally:
+        os.close(fd)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print('BUILDER_ERROR: ' + str(error), file=sys.stderr)
+        sys.exit(1)
