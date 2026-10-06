@@ -101,3 +101,5 @@ python3 -m unittest discover -s ops/ci-builder/tests -v
 включая наследование блокировки дочерним процессом. Проверен синтаксис shell
 и структура обоих YAML. Реальный Podman/CI доступен только на VPS: первый
 dry-run и оба CI-прогона являются проверкой интеграции.
+
+PostgreSQL: project key `postgresql`, image `localhost/postgresql-ac`, lock `postgresql.lock`.

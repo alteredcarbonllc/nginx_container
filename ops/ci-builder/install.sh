@@ -19,7 +19,7 @@ for p in list(reversed(root.parents)) + [root]:
         raise SystemExit('Unsafe directory: ' + str(p))
 os.chown(root, 1001, gid)
 os.chmod(root, 0o700)
-for name in ('store.lock', 'nginx.lock', 'php.lock'):
+for name in ('store.lock', 'nginx.lock', 'php.lock', 'postgresql.lock'):
     path = root / name
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -31,5 +31,8 @@ for name in ('store.lock', 'nginx.lock', 'php.lock'):
         os.fchown(fd, 1001, gid)
         os.close(fd)
 PY
-install -o root -g root -m 0755 "$base/ac-ci-builder-store" /usr/local/bin/ac-ci-builder-store
+temporary=$(mktemp /usr/local/bin/.ac-ci-builder-store.XXXXXXXX)
+trap 'rm -f "$temporary"' EXIT
+install -o root -g root -m 0755 "$base/ac-ci-builder-store" "$temporary"
+mv -f "$temporary" /usr/local/bin/ac-ci-builder-store
 echo 'BUILDER_TOOLS_INSTALLED: activation flag unchanged; no cleanup performed'

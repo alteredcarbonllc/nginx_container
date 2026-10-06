@@ -46,6 +46,11 @@ class Retention(unittest.TestCase):
         rows = self.rows + [row(n, repo='localhost/php-carbonblog') for n in range(6, 11)]
         self.assertEqual(set(self.ids(rows)), {f'{n:064x}' for n in (1, 2, 6, 7)})
 
+    def test_postgresql_retention(self):
+        rows=[row(n, age=20-n, repo='localhost/postgresql-ac') for n in range(1,6)]
+        self.assertEqual(self.ids(rows), [f'{1:064x}',f'{2:064x}'])
+        self.assertEqual(m.REPOS['postgresql'],'localhost/postgresql-ac')
+
     def test_base_and_untagged(self):
         extra = [row(20, repo='docker.io/library/php'), row(21)]
         extra[1]['RepoTags'] = None
