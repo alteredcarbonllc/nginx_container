@@ -51,6 +51,14 @@ class Retention(unittest.TestCase):
         self.assertEqual(self.ids(rows), [f'{1:064x}',f'{2:064x}'])
         self.assertEqual(m.REPOS['postgresql'],'localhost/postgresql-ac')
 
+    def test_mail_and_fixture_retention(self):
+        for key,repo in [('dovecot','localhost/dovecot-ac'),('postfix','localhost/postfix-ac'),
+                         ('dovecot-fixture','localhost/dovecot-ci-fixture'),
+                         ('postfix-fixture','localhost/postfix-ci-fixture')]:
+            self.assertEqual(m.REPOS[key],repo)
+            rows=[row(n,age=20-n,repo=repo) for n in range(1,6)]
+            self.assertEqual(self.ids(rows),[f'{1:064x}',f'{2:064x}'])
+
     def test_base_and_untagged(self):
         extra = [row(20, repo='docker.io/library/php'), row(21)]
         extra[1]['RepoTags'] = None
