@@ -46,6 +46,12 @@ class Retention(unittest.TestCase):
         rows = self.rows + [row(n, repo='localhost/php-carbonblog') for n in range(6, 11)]
         self.assertEqual(set(self.ids(rows)), {f'{n:064x}' for n in (1, 2, 6, 7)})
 
+    def test_rspamd_retention(self):
+        self.assertEqual(m.REPOS['rspamd'], 'localhost/rspamd-ac')
+        rows = [row(n, age=20-n, repo='localhost/rspamd-ac') for n in range(1, 6)]
+        self.assertEqual(self.ids(rows), [f'{1:064x}', f'{2:064x}'])
+        self.assertEqual(self.ids(rows, used=[f'{1:064x}']), [f'{2:064x}'])
+
     def test_redis_retention(self):
         self.assertEqual(m.REPOS['redis'], 'localhost/redis-ac')
         rows = [row(n, age=20-n, repo='localhost/redis-ac') for n in range(1, 6)]

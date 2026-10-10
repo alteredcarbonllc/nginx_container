@@ -19,7 +19,7 @@ for p in list(reversed(root.parents)) + [root]:
         raise SystemExit('Unsafe directory: ' + str(p))
 os.chown(root, 1001, gid)
 os.chmod(root, 0o700)
-for name in ('store.lock', 'nginx.lock', 'php.lock', 'postgresql.lock', 'redis.lock', 'dovecot.lock', 'postfix.lock', 'dovecot-fixture.lock', 'postfix-fixture.lock'):
+for name in ('store.lock', 'nginx.lock', 'php.lock', 'postgresql.lock', 'redis.lock', 'rspamd.lock', 'dovecot.lock', 'postfix.lock', 'dovecot-fixture.lock', 'postfix-fixture.lock'):
     path = root / name
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

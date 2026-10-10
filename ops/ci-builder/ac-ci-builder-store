@@ -16,7 +16,7 @@ HOME = '/var/lib/ac-ci-builder'
 STATE = Path(HOME, '.local/state/ac-ci-builder')
 FLAG = Path('/etc/ac/ci-builder-cleanup-enabled')
 PODMAN = '/usr/local/bin/podman'
-REPOS = {'nginx': 'localhost/nginx-container', 'php': 'localhost/php-carbonblog', 'postgresql': 'localhost/postgresql-ac', 'redis': 'localhost/redis-ac', 'dovecot': 'localhost/dovecot-ac', 'postfix': 'localhost/postfix-ac', 'dovecot-fixture': 'localhost/dovecot-ci-fixture', 'postfix-fixture': 'localhost/postfix-ci-fixture'}
+REPOS = {'nginx': 'localhost/nginx-container', 'php': 'localhost/php-carbonblog', 'postgresql': 'localhost/postgresql-ac', 'redis': 'localhost/redis-ac', 'rspamd': 'localhost/rspamd-ac', 'dovecot': 'localhost/dovecot-ac', 'postfix': 'localhost/postfix-ac', 'dovecot-fixture': 'localhost/dovecot-ci-fixture', 'postfix-fixture': 'localhost/postfix-ci-fixture'}
 
 
 def image_id(value):
